@@ -3,8 +3,9 @@ import ReactFlow, {
   Background,
   Controls,
   MiniMap,
-  useNodesState,
+  MarkerType,
   useEdgesState,
+  useNodesState,
 } from "reactflow";
 import "reactflow/dist/style.css";
 import ExcelJS from "exceljs";
@@ -107,7 +108,8 @@ export default function App() {
             });
         });
 
-        newEdges.push({ id: `e-${src}-${tgt}-${idx}`, source: src, target: tgt, label });
+        newEdges.push({
+          markerEnd: { type: MarkerType.ArrowClosed }, id: `e-${src}-${tgt}-${idx}`, source: src, target: tgt, label });
       });
     });
 
