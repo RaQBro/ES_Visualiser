@@ -4,6 +4,7 @@ import ReactFlow, {
   Controls,
   MiniMap,
   MarkerType,
+  getBezierPath,
   useEdgesState,
   useNodesState,
 } from "reactflow";
@@ -11,12 +12,10 @@ import "reactflow/dist/style.css";
 import ExcelJS from "exceljs";
 import dagre from "dagre";
 
-/* --------------------------------------------------------------
-   Minimal Button & Input components (no external UI libs)
--------------------------------------------------------------- */
+/* ---------- Minimal in‑file Button & Input ---------- */
 const Button = ({ children, className = "", ...props }) => (
   <button
-    className={`rounded-lg bg-indigo-600 px-4 py-2 text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50 ${className}`.trim()}
+    className={`rounded-lg bg-indigo-600 px-4 py-2 text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50 ${className}`}
     {...props}
   >
     {children}
@@ -25,157 +24,155 @@ const Button = ({ children, className = "", ...props }) => (
 
 const Input = ({ className = "", ...props }) => (
   <input
-    className={`rounded-lg border border-gray-600 bg-gray-800 text-gray-100 placeholder-gray-400 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 ${className}`.trim()}
+    className={`rounded-lg border border-gray-600 bg-gray-800 text-gray-100 placeholder-gray-400 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 ${className}`}
     {...props}
   />
 );
 
-/* --------------------------- Layout + highlight constants --------------------------- */
-const NODE_WIDTH = 150;
-const NODE_HEIGHT = 40;
-const NODE_HIGHLIGHT = { border: "2px solid #ff0072", background: "#fff3f8" };
-const EDGE_HIGHLIGHT = { stroke: "#ff0072", strokeWidth: 2 };
+/* ---------- Custom edge w/ tooltip + arrow ---------- */
+const EdgeWithTooltip = ({ id, sourceX, sourceY, targetX, targetY, markerEnd, style, data }) => {
+  const [edgePath] = getBezierPath({ sourceX, sourceY, targetX, targetY });
+  return (
+    <g>
+      <path id={id} d={edgePath} markerEnd={markerEnd} style={style} className="react-flow__edge-path" />
+      {data?.tooltip && <title>{data.tooltip}</title>}
+    </g>
+  );
+};
+const edgeTypes = { tooltip: EdgeWithTooltip };
+
+/* ---------- constants ---------- */
+const NODE_W = 150;
+const NODE_H = 40;
+const EDGE_STYLE = { stroke: "#f5f5f5", strokeWidth: 2 };
+const NODE_MATCH_STYLE = { border: "3px solid #ff4d4f" };
 
 export default function App() {
-  /* ------------------------ React Flow state ------------------------ */
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
-  const [search, setSearch] = useState("");
-  const fileInputRef = useRef(null);
+  const [query, setQuery] = useState("");
+  const fileInput = useRef(null);
 
-  /* ----------------------- Dagre layout helper ---------------------- */
-  const runLayout = (rawNodes, rawEdges) => {
+  /* Dagre layout */
+  const layout = (rawNodes, rawEdges) => {
     const g = new dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}));
     g.setGraph({ rankdir: "LR", nodesep: 50, ranksep: 80 });
-
-    rawNodes.forEach((n) => g.setNode(n.id, { width: NODE_WIDTH, height: NODE_HEIGHT }));
+    rawNodes.forEach((n) => g.setNode(n.id, { width: NODE_W, height: NODE_H }));
     rawEdges.forEach((e) => g.setEdge(e.source, e.target));
     dagre.layout(g);
-
-    return rawNodes.map((n) => {
-      const { x, y } = g.node(n.id);
-      return { ...n, position: { x, y } };
-    });
+    return rawNodes.map((n) => ({ ...n, position: g.node(n.id) }));
   };
 
-  /* ------------------- Highlight search matches (nodes + edges) ------------------- */
-  const applySearchHighlight = useCallback(
+  /* Search filter: show matches + neighbors & mark matches */
+  const applySearchFilter = useCallback(
     (term) => {
+      if (!term) {
+        setNodes((prev) => prev.map((n) => ({ ...n, hidden: false, style: {} })));
+        setEdges((prev) => prev.map((e) => ({ ...e, hidden: false })));
+        return;
+      }
+
       const lower = term.toLowerCase();
 
+      // 1. Get matching node IDs by label
+      const matchedIds = new Set(nodes.filter((n) => n.data.label.toLowerCase().includes(lower)).map((n) => n.id));
+
+      // 2. Determine visible node IDs (matches + any directly connected)
+      const visibleIds = new Set(matchedIds);
+      edges.forEach((e) => {
+        const labelHit = e.label?.toLowerCase().includes(lower) || e.data?.tooltip?.toLowerCase().includes(lower);
+        const endpointHit = matchedIds.has(e.source) || matchedIds.has(e.target);
+        if (labelHit || endpointHit) {
+          visibleIds.add(e.source);
+          visibleIds.add(e.target);
+        }
+      });
+
+      // 3. Update node hidden & style
       setNodes((prev) =>
-        prev.map((n) => {
-          const match = term && n.data.label.toLowerCase().includes(lower);
-          return { ...n, style: match ? NODE_HIGHLIGHT : {} };
-        })
+        prev.map((n) => ({
+          ...n,
+          hidden: !visibleIds.has(n.id),
+          style: matchedIds.has(n.id) ? { ...n.style, ...NODE_MATCH_STYLE } : { ...n.style, border: undefined },
+        }))
       );
 
+      // 4. Update edge hidden (show if both endpoints visible)
       setEdges((prev) =>
-        prev.map((e) => {
-          const labelMatch = e.label && e.label.toLowerCase().includes(lower);
-          const srcMatch = e.source && e.source.toLowerCase().includes(lower);
-          const tgtMatch = e.target && e.target.toLowerCase().includes(lower);
-          const match = term && (labelMatch || srcMatch || tgtMatch);
-          return { ...e, style: match ? EDGE_HIGHLIGHT : {} };
-        })
+        prev.map((e) => ({
+          ...e,
+          hidden: !(visibleIds.has(e.source) && visibleIds.has(e.target)),
+        }))
       );
     },
-    [setNodes, setEdges]
+    [nodes, edges]
   );
 
-  /* ------------------------- Upload handler ------------------------- */
+  /* Excel upload */
   const handleUpload = useCallback(async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(await file.arrayBuffer());
-
     const nodeMap = new Map();
-    const newEdges = [];
+    const arrEdges = [];
 
     wb.eachSheet((ws) => {
       ws.eachRow({ includeEmpty: false }, (row, idx) => {
-        if (idx === 1) return; // header
-        const [src, tgt, label] = row.values.slice(1).map(String);
-
+        if (idx === 1) return;
+        const [src, tgt, label, link] = row.values.slice(1).map(String);
         [src, tgt].forEach((id) => {
-          if (!nodeMap.has(id))
-            nodeMap.set(id, {
-              id,
-              data: { label: id },
-              position: { x: 0, y: 0 },
-            });
+          if (!nodeMap.has(id)) nodeMap.set(id, { id, data: { label: id }, position: { x: 0, y: 0 } });
         });
-
-        newEdges.push({
-          markerEnd: { type: MarkerType.ArrowClosed }, id: `e-${src}-${tgt}-${idx}`, source: src, target: tgt, label });
+        arrEdges.push({
+          id: `e-${src}-${tgt}-${idx}`,
+          source: src,
+          target: tgt,
+          label: label || "",
+          data: { tooltip: link || label || "" },
+          type: "tooltip",
+          markerEnd: { type: MarkerType.ArrowClosed, width: 24, height: 24 },
+          style: EDGE_STYLE,
+        });
       });
     });
 
-    const laidOutNodes = runLayout([...nodeMap.values()], newEdges);
-    setNodes(laidOutNodes);
-    setEdges(newEdges);
-    setSearch("");
+    setNodes(layout([...nodeMap.values()], arrEdges));
+    setEdges(arrEdges);
+    setQuery("");
   }, []);
 
-  /* ------------------------- Relayout button ------------------------ */
-  const handleRelayout = () => {
+  const relayout = () => {
     if (!nodes.length) return;
-    setNodes(runLayout(nodes, edges));
-    if (search) applySearchHighlight(search);
+    setNodes(layout(nodes, edges));
+    if (query) applySearchFilter(query);
   };
 
-  /* ------------------------ Search handler ------------------------- */
-  const handleSearchChange = (e) => {
-    const term = e.target.value;
-    setSearch(term);
-    applySearchHighlight(term);
-  };
-
-  /* ------------------------------ JSX ------------------------------ */
+  /* JSX */
   return (
     <div style={{ position: "fixed", inset: 0, background: "#1e1e1e" }}>
-      {/* Hidden file input */}
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".xlsx,.xls"
-        onChange={handleUpload}
-        style={{ display: "none" }}
-      />
+      <input ref={fileInput} type="file" accept=".xlsx,.xls" onChange={handleUpload} style={{ display: "none" }} />
 
-      {/* Toolbar */}
-      <div
-        style={{
-          position: "absolute",
-          zIndex: 10,
-          margin: "1rem",
-          padding: "1rem",
-          display: "flex",
-          alignItems: "center",
-          gap: "1rem",
-          background: "rgba(64,64,64,0.8)",
-          borderRadius: "1rem",
-        }}
-      >
-        <Button onClick={() => fileInputRef.current?.click()}>Upload Excel</Button>
-        <Button onClick={handleRelayout} disabled={!nodes.length} className="bg-indigo-500 hover:bg-indigo-600">
-          Auto-arrange
-        </Button>
+      <div style={{ position: "absolute", zIndex: 10, margin: "1rem", padding: "1rem", display: "flex", gap: "1rem", background: "rgba(64,64,64,0.8)", borderRadius: "1rem" }}>
+        <Button onClick={() => fileInput.current?.click()}>Upload Excel</Button>
+        <Button onClick={relayout} disabled={!nodes.length}>Auto-arrange</Button>
         <Input
-          placeholder="Search nodes & edges…"
-          value={search}
-          onChange={handleSearchChange}
+          placeholder="Search & focus…"
+          value={query}
+          onChange={(e) => {
+            const t = e.target.value;
+            setQuery(t);
+            applySearchFilter(t);
+          }}
           style={{ width: "14rem", height: "2.5rem" }}
         />
       </div>
 
-      {/* Graph canvas */}
       <ReactFlow
         style={{ width: "100%", height: "100%" }}
         nodes={nodes}
         edges={edges}
+        edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         fitView
