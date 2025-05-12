@@ -40,21 +40,19 @@ const EdgeWithTooltip = ({ id, sourceX, sourceY, targetX, targetY, markerEnd, st
 };
 
 const edgeTypes = { tooltip: EdgeWithTooltip };
-
 const EDGE_STYLE = { stroke: "#f5f5f5", strokeWidth: 2 };
-const NODE_MATCH_STYLE = { border: "3px solid #ff4d4f" };
+const HIGHLIGHT_STYLE = { border: "3px solid #ff4d4f" };
 
 const measureText = (() => {
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
+  const c = document.createElement("canvas");
+  const ctx = c.getContext("2d");
   ctx.font = "14px sans-serif";
   return (t) => ctx.measureText(t).width;
 })();
 
-const getNodeSize = (label) => {
+const calcNodeSize = (label) => {
   const lines = label.split("\n");
-  const rawWidth = Math.max(...lines.map(measureText)) + 24;
-  const width = Math.min(Math.max(80, rawWidth), 600);
+  const width = Math.min(Math.max(80, Math.max(...lines.map(measureText)) + 24), 600);
   const height = Math.max(40, lines.length * 20);
   return { width, height };
 };
@@ -62,57 +60,54 @@ const getNodeSize = (label) => {
 const Flow = () => {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
-  const [query, setQuery] = useState("");
-  const fileInput = useRef(null);
+  const [search, setSearch] = useState("");
+  const fileRef = useRef(null);
 
-  const layoutGraph = useCallback((nArr, eArr) => {
+  const dagreLayout = useCallback((nArr, eArr) => {
     const g = new dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}));
     g.setGraph({ rankdir: "LR", nodesep: 50, ranksep: 80 });
-    nArr.forEach((n) => {
-      const { width, height } = getNodeSize(n.data.label);
-      g.setNode(n.id, { width, height });
-    });
+    nArr.forEach((n) => g.setNode(n.id, calcNodeSize(n.data.label)));
     eArr.forEach((e) => g.setEdge(e.source, e.target));
     dagre.layout(g);
-    return nArr.map((n) => ({ ...n, position: g.node(n.id), ...getNodeSize(n.data.label) }));
+    return nArr.map((n) => ({ ...n, position: g.node(n.id), ...calcNodeSize(n.data.label) }));
   }, []);
 
-  const filterGraph = useCallback(
+  const applyFilter = useCallback(
     (term) => {
       if (!term) {
-        setNodes((p) => p.map((n) => ({ ...n, hidden: false, style: { ...n.style, border: undefined } })));
-        setEdges((p) => p.map((e) => ({ ...e, hidden: false })));
+        setNodes((prev) => prev.map((n) => ({ ...n, hidden: false, style: { ...n.style, border: undefined } })));
+        setEdges((prev) => prev.map((e) => ({ ...e, hidden: false })));
         return;
       }
-      const lower = term.toLowerCase();
-      const matched = new Set(nodes.filter((n) => n.data.label.toLowerCase().includes(lower)).map((n) => n.id));
+      const q = term.toLowerCase();
+      const matched = new Set(nodes.filter((n) => n.data.label.toLowerCase().includes(q)).map((n) => n.id));
       const visible = new Set(matched);
       edges.forEach((e) => {
-        const hit = e.label?.toLowerCase().includes(lower) || e.data?.tooltip?.toLowerCase().includes(lower);
+        const hit = e.label?.toLowerCase().includes(q) || e.data?.tooltip?.toLowerCase().includes(q);
         if (hit || matched.has(e.source) || matched.has(e.target)) {
           visible.add(e.source);
           visible.add(e.target);
         }
       });
-      setNodes((p) =>
-        p.map((n) => ({
+      setNodes((prev) =>
+        prev.map((n) => ({
           ...n,
           hidden: !visible.has(n.id),
-          style: matched.has(n.id) ? { ...n.style, ...NODE_MATCH_STYLE } : { ...n.style, border: undefined },
+          style: matched.has(n.id) ? { ...n.style, ...HIGHLIGHT_STYLE } : { ...n.style, border: undefined },
         }))
       );
-      setEdges((p) => p.map((e) => ({ ...e, hidden: !(visible.has(e.source) && visible.has(e.target)) })));
+      setEdges((prev) => prev.map((e) => ({ ...e, hidden: !(visible.has(e.source) && visible.has(e.target)) })));
     },
     [nodes, edges]
   );
 
-  const uploadExcel = useCallback(async (e) => {
+  const handleUpload = useCallback(async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(await file.arrayBuffer());
     const map = new Map();
-    const edgeArr = [];
+    const newEdges = [];
     wb.eachSheet((ws) => {
       ws.eachRow({ includeEmpty: false }, (row, idx) => {
         if (idx === 1) return;
@@ -133,7 +128,7 @@ const Flow = () => {
               },
             });
         });
-        edgeArr.push({
+        newEdges.push({
           id: `e-${src}-${tgt}-${idx}`,
           source: src,
           target: tgt,
@@ -145,30 +140,30 @@ const Flow = () => {
         });
       });
     });
-    setNodes(layoutGraph([...map.values()], edgeArr));
-    setEdges(edgeArr);
-    setQuery("");
-  }, [layoutGraph]);
+    setNodes(dagreLayout([...map.values()], newEdges));
+    setEdges(newEdges);
+    setSearch("");
+  }, [dagreLayout]);
 
   const relayout = () => {
     if (!nodes.length) return;
-    setNodes(layoutGraph(nodes, edges));
-    if (query) filterGraph(query);
+    setNodes(dagreLayout(nodes, edges));
+    if (search) applyFilter(search);
   };
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "#1e1e1e" }}>
-      <input ref={fileInput} type="file" accept=".xlsx,.xls" onChange={uploadExcel} style={{ display: "none" }} />
+      <input ref={fileRef} type="file" accept=".xlsx,.xls" onChange={handleUpload} style={{ display: "none" }} />
       <div style={{ position: "absolute", zIndex: 10, margin: 16, padding: 16, display: "flex", gap: 16, background: "rgba(64,64,64,0.8)", borderRadius: 16 }}>
-        <Button onClick={() => fileInput.current?.click()}>Upload Excel</Button>
+        <Button onClick={() => fileRef.current?.click()}>Upload Excel</Button>
         <Button onClick={relayout} disabled={!nodes.length}>Auto-arrange</Button>
         <Input
-          placeholder="Search & focus…"
-          value={query}
+          placeholder="Search…"
+          value={search}
           onChange={(e) => {
             const v = e.target.value;
-            setQuery(v);
-            filterGraph(v);
+            setSearch(v);
+            applyFilter(v);
           }}
           style={{ width: 224, height: 40 }}
         />
