@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactFlow, {
   Background,
   Controls,
@@ -7,11 +7,15 @@ import ReactFlow, {
   getBezierPath,
   useNodesState,
   useEdgesState,
+  useReactFlow,
+  getRectOfNodes,
+  getTransformForBounds,
   ReactFlowProvider,
 } from "reactflow";
 import "reactflow/dist/style.css";
 import ExcelJS from "exceljs";
 import dagre from "dagre";
+import { toPng } from "html-to-image";
 
 const Button = ({ children, className = "", ...props }) => (
   <button
@@ -47,13 +51,11 @@ const Toast = ({ message, type = "error", onClose }) => {
   }, [onClose]);
 
   const bgColor = type === "error" ? "bg-red-600" : type === "success" ? "bg-green-600" : "bg-blue-600";
-  
+
   return (
     <div
-      className={`fixed top-4 right-4 z-50 ${bgColor} text-white px-6 py-4 rounded-lg shadow-lg max-w-md animate-slide-in`}
-      style={{
-        animation: "slideIn 0.3s ease-out",
-      }}
+      className={`fixed top-4 right-4 z-50 ${bgColor} text-white px-6 py-4 rounded-lg shadow-lg max-w-md`}
+      style={{ animation: "slideIn 0.3s ease-out" }}
     >
       <div className="flex items-start gap-3">
         <div className="flex-1">
@@ -72,7 +74,7 @@ const Toast = ({ message, type = "error", onClose }) => {
 };
 
 const edgeTypes = { tooltip: EdgeWithTooltip };
-const EDGE_STYLE = { stroke: "#f5f5f5", strokeWidth: 2 };
+const EDGE_STYLE = { stroke: "#f5f5f5", strokeWidth: 2, fill: "none" };
 const HIGHLIGHT_STYLE = { border: "3px solid #ff4d4f" };
 
 const measureText = (() => {
@@ -94,19 +96,21 @@ const Flow = () => {
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [search, setSearch] = useState("");
   const [isFiltering, setIsFiltering] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
   const [toast, setToast] = useState(null);
   const fileRef = useRef(null);
   const searchTimerRef = useRef(null);
-  
+  const { getNodes } = useReactFlow();
+
   // CRITICAL FIX: Use refs to track latest nodes/edges for debounced filter
   const nodesRef = useRef(nodes);
   const edgesRef = useRef(edges);
-  
+
   // Keep refs in sync with state
   useEffect(() => {
     nodesRef.current = nodes;
   }, [nodes]);
-  
+
   useEffect(() => {
     edgesRef.current = edges;
   }, [edges]);
@@ -124,18 +128,18 @@ const Flow = () => {
     // CRITICAL FIX: Use refs instead of closure variables to get latest nodes/edges
     const currentNodes = nodesRef.current;
     const currentEdges = edgesRef.current;
-    
+
     if (!term) {
       setNodes((prev) => prev.map((n) => ({ ...n, hidden: false, style: { ...n.style, border: undefined } })));
       setEdges((prev) => prev.map((e) => ({ ...e, hidden: false })));
       setIsFiltering(false);
       return;
     }
-    
+
     const q = term.toLowerCase();
     const matched = new Set(currentNodes.filter((n) => n.data.label.toLowerCase().includes(q)).map((n) => n.id));
     const visible = new Set(matched);
-    
+
     currentEdges.forEach((e) => {
       const hit = e.label?.toLowerCase().includes(q) || e.data?.tooltip?.toLowerCase().includes(q);
       if (hit || matched.has(e.source) || matched.has(e.target)) {
@@ -143,7 +147,7 @@ const Flow = () => {
         visible.add(e.target);
       }
     });
-    
+
     setNodes((prev) =>
       prev.map((n) => ({
         ...n,
@@ -175,43 +179,35 @@ const Flow = () => {
     // Empty file validation
     if (file.size === 0) {
       showToast("The selected file is empty. Please choose a valid Excel file.", "error");
-      // Reset file input
-      if (fileRef.current) {
-        fileRef.current.value = "";
-      }
+      if (fileRef.current) fileRef.current.value = "";
       return;
     }
 
     // File size validation (5MB limit)
-    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+    const MAX_FILE_SIZE = 5 * 1024 * 1024;
     if (file.size > MAX_FILE_SIZE) {
       const sizeMB = (file.size / 1024 / 1024).toFixed(1);
       showToast(`File too large (${sizeMB}MB). Maximum size is 5MB. Please compress or split your data.`, "error");
-      // Reset file input
-      if (fileRef.current) {
-        fileRef.current.value = "";
-      }
+      if (fileRef.current) fileRef.current.value = "";
       return;
     }
 
+    setIsLoading(true);
     try {
       const wb = new ExcelJS.Workbook();
       await wb.xlsx.load(await file.arrayBuffer());
       const map = new Map();
       const newEdges = [];
       let rowCount = 0;
-      
+
       wb.eachSheet((ws) => {
         ws.eachRow({ includeEmpty: false }, (row, idx) => {
           if (idx === 1) return; // Skip header row
           rowCount++;
           const [src, tgt, label, link] = row.values.slice(1).map(String);
-          
-          // Validate required columns
-          if (!src || !tgt || src === "undefined" || tgt === "undefined") {
-            return; // Skip invalid rows
-          }
-          
+
+          if (!src || !tgt || src === "undefined" || tgt === "undefined") return;
+
           [src, tgt].forEach((id) => {
             if (!map.has(id))
               map.set(id, {
@@ -240,30 +236,24 @@ const Flow = () => {
           });
         });
       });
-      
+
       if (map.size === 0 || newEdges.length === 0) {
         showToast("No valid data found in Excel file. Please check the format:\n- Column A: Source Node\n- Column B: Target Node\n- Column C: Edge Label (optional)\n- Column D: Tooltip (optional)", "error");
-        // Reset file input
-        if (fileRef.current) {
-          fileRef.current.value = "";
-        }
+        if (fileRef.current) fileRef.current.value = "";
         return;
       }
-      
+
       setNodes(dagreLayout([...map.values()], newEdges));
       setEdges(newEdges);
       setSearch("");
-      
+
       showToast(`Successfully loaded ${map.size} nodes and ${newEdges.length} edges from ${rowCount} rows.`, "success");
-      
-      // Reset file input to allow re-uploading the same file
-      if (fileRef.current) {
-        fileRef.current.value = "";
-      }
+
+      if (fileRef.current) fileRef.current.value = "";
     } catch (err) {
       console.error('Excel parse error:', err);
       let errorMessage = 'Failed to read Excel file. ';
-      
+
       if (err.message?.includes('Corrupt')) {
         errorMessage += 'The file appears to be corrupted.';
       } else if (err.message?.includes('zip')) {
@@ -271,15 +261,44 @@ const Flow = () => {
       } else {
         errorMessage += 'Please check the file format:\n- Must be .xlsx or .xls\n- Column A: Source Node\n- Column B: Target Node';
       }
-      
+
       showToast(errorMessage, "error");
-      
-      // Reset file input
-      if (fileRef.current) {
-        fileRef.current.value = "";
-      }
+      if (fileRef.current) fileRef.current.value = "";
+    } finally {
+      setIsLoading(false);
     }
   }, [dagreLayout, showToast, setNodes, setEdges]);
+
+  const handleExport = useCallback(async () => {
+    const viewportEl = document.querySelector(".react-flow__viewport");
+    if (!viewportEl) return;
+
+    const nodesBounds = getRectOfNodes(getNodes());
+    const PAD = 80;
+    const IMAGE_WIDTH = Math.max(800, Math.ceil(nodesBounds.width) + PAD * 2);
+    const IMAGE_HEIGHT = Math.max(600, Math.ceil(nodesBounds.height) + PAD * 2);
+    const [x, y, zoom] = getTransformForBounds(nodesBounds, IMAGE_WIDTH, IMAGE_HEIGHT, 0.05, 2);
+
+    try {
+      const dataUrl = await toPng(viewportEl, {
+        backgroundColor: "#1e1e1e",
+        width: IMAGE_WIDTH,
+        height: IMAGE_HEIGHT,
+        style: {
+          width: `${IMAGE_WIDTH}px`,
+          height: `${IMAGE_HEIGHT}px`,
+          transform: `translate(${x}px, ${y}px) scale(${zoom})`,
+        },
+      });
+      const a = document.createElement("a");
+      a.href = dataUrl;
+      a.download = "graph-export.png";
+      a.click();
+    } catch (err) {
+      console.error("Export failed:", err);
+      showToast("Export failed. Please try again.", "error");
+    }
+  }, [getNodes, showToast]);
 
   const relayout = () => {
     if (!nodes.length) return;
@@ -287,12 +306,25 @@ const Flow = () => {
     if (search) applyFilter(search);
   };
 
+  const stats = useMemo(() => {
+    const totalNodes = nodes.length;
+    const totalEdges = edges.length;
+    const visibleNodes = search ? nodes.filter((n) => !n.hidden).length : totalNodes;
+    const visibleEdges = search ? edges.filter((e) => !e.hidden).length : totalEdges;
+    return { totalNodes, totalEdges, visibleNodes, visibleEdges };
+  }, [nodes, edges, search]);
+
   return (
     <div style={{ position: "fixed", inset: 0, background: "#1e1e1e" }}>
       <input ref={fileRef} type="file" accept=".xlsx,.xls" onChange={handleUpload} style={{ display: "none" }} />
+
+      {/* Toolbar */}
       <div style={{ position: "absolute", zIndex: 10, margin: 16, padding: 16, display: "flex", gap: 16, background: "rgba(64,64,64,0.8)", borderRadius: 16 }}>
-        <Button onClick={() => fileRef.current?.click()}>Upload Excel</Button>
-        <Button onClick={relayout} disabled={!nodes.length}>Auto-arrange</Button>
+        <Button onClick={() => fileRef.current?.click()} disabled={isLoading}>
+          {isLoading ? "Loading…" : "Upload Excel"}
+        </Button>
+        <Button onClick={relayout} disabled={!nodes.length || isLoading}>Auto-arrange</Button>
+        <Button onClick={handleExport} disabled={!nodes.length || isLoading}>Export PNG</Button>
         <div style={{ position: "relative" }}>
           <Input
             placeholder="Search…"
@@ -300,19 +332,9 @@ const Flow = () => {
             onChange={(e) => {
               const v = e.target.value;
               setSearch(v);
-              
-              // Clear existing timer
-              if (searchTimerRef.current) {
-                clearTimeout(searchTimerRef.current);
-              }
-              
-              // Show filtering indicator
+              if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
               setIsFiltering(true);
-              
-              // Debounce filter application (300ms delay)
-              searchTimerRef.current = setTimeout(() => {
-                applyFilter(v);
-              }, 300);
+              searchTimerRef.current = setTimeout(() => applyFilter(v), 300);
             }}
             style={{ width: 224, height: 40 }}
           />
@@ -333,20 +355,92 @@ const Flow = () => {
           )}
         </div>
       </div>
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        edgeTypes={edgeTypes}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        fitView
-        style={{ width: "100%", height: "100%" }}
-      >
-        <Background gap={16} size={1} />
-        <MiniMap zoomable pannable />
-        <Controls />
-      </ReactFlow>
-      
+
+      {/* Flow canvas */}
+      <div style={{ width: "100%", height: "100%" }}>
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          edgeTypes={edgeTypes}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          fitView
+          style={{ width: "100%", height: "100%" }}
+        >
+          <Background gap={16} size={1} />
+          <MiniMap zoomable pannable />
+          <Controls />
+        </ReactFlow>
+      </div>
+
+      {/* Onboarding panel — shown when no graph is loaded */}
+      {nodes.length === 0 && !isLoading && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 5,
+            pointerEvents: "none",
+          }}
+        >
+          <div className="onboarding-panel">
+            <h2 style={{ color: "#f5f5f5", fontSize: 20, marginBottom: 8, fontWeight: 600 }}>
+              Getting Started
+            </h2>
+            <p style={{ color: "#aaa", fontSize: 14, marginBottom: 16 }}>
+              Upload an Excel file (<code>.xlsx</code> / <code>.xls</code>) to visualise it as an interactive graph.
+            </p>
+            <p style={{ color: "#ccc", fontSize: 13, marginBottom: 10, fontWeight: 500 }}>Required columns (row 1 = header):</p>
+            <table className="onboarding-table">
+              <thead>
+                <tr>
+                  <th>Column</th>
+                  <th>Name</th>
+                  <th>Required</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td>A</td><td>Source Node</td><td>Yes</td></tr>
+                <tr><td>B</td><td>Target Node</td><td>Yes</td></tr>
+                <tr><td>C</td><td>Edge Label</td><td>No</td></tr>
+                <tr><td>D</td><td>Tooltip</td><td>No</td></tr>
+              </tbody>
+            </table>
+            <p style={{ color: "#888", fontSize: 12, marginTop: 14 }}>
+              Multi-sheet workbooks are supported — all sheets are merged into one graph.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Stats panel — bottom-left, above React Flow controls */}
+      {nodes.length > 0 && (
+        <div className="stats-panel">
+          <span>{stats.totalNodes} nodes</span>
+          <span className="stats-divider">·</span>
+          <span>{stats.totalEdges} edges</span>
+          {search && (
+            <>
+              <span className="stats-divider">·</span>
+              <span style={{ color: "#6366f1" }}>
+                {stats.visibleNodes} / {stats.totalNodes} visible
+              </span>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Loading overlay */}
+      {isLoading && (
+        <div className="loading-overlay">
+          <div className="spinner" />
+          <p style={{ color: "#ccc", marginTop: 16, fontSize: 14 }}>Processing file…</p>
+        </div>
+      )}
+
       {/* Toast notifications */}
       {toast && (
         <Toast
@@ -355,17 +449,97 @@ const Flow = () => {
           onClose={() => setToast(null)}
         />
       )}
-      
+
       <style>{`
         @keyframes slideIn {
-          from {
-            transform: translateX(100%);
-            opacity: 0;
-          }
-          to {
-            transform: translateX(0);
-            opacity: 1;
-          }
+          from { transform: translateX(100%); opacity: 0; }
+          to   { transform: translateX(0);    opacity: 1; }
+        }
+        @keyframes spin {
+          to { transform: rotate(360deg); }
+        }
+
+        .loading-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.6);
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          z-index: 100;
+        }
+
+        .spinner {
+          width: 48px;
+          height: 48px;
+          border: 4px solid rgba(255, 255, 255, 0.15);
+          border-top-color: #6366f1;
+          border-radius: 50%;
+          animation: spin 0.8s linear infinite;
+        }
+
+        .stats-panel {
+          position: absolute;
+          bottom: 140px;
+          left: 10px;
+          z-index: 10;
+          background: rgba(45, 45, 45, 0.85);
+          border: 1px solid #444;
+          border-radius: 8px;
+          padding: 6px 12px;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 12px;
+          color: #ccc;
+          backdrop-filter: blur(4px);
+        }
+
+        .stats-divider {
+          color: #555;
+        }
+
+        .onboarding-panel {
+          background: rgba(40, 40, 40, 0.97);
+          border: 1px solid #444;
+          border-radius: 16px;
+          padding: 32px 36px;
+          max-width: 460px;
+          width: calc(100% - 64px);
+          pointer-events: auto;
+          box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        }
+
+        .onboarding-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 13px;
+          color: #ccc;
+        }
+
+        .onboarding-table th {
+          text-align: left;
+          padding: 6px 10px;
+          background: rgba(99, 102, 241, 0.15);
+          color: #a5b4fc;
+          font-weight: 500;
+          border-bottom: 1px solid #444;
+        }
+
+        .onboarding-table td {
+          padding: 6px 10px;
+          border-bottom: 1px solid #333;
+        }
+
+        .onboarding-table tr:last-child td {
+          border-bottom: none;
+        }
+
+        .onboarding-table td:first-child {
+          font-family: monospace;
+          color: #818cf8;
+          font-weight: 600;
         }
       `}</style>
     </div>
